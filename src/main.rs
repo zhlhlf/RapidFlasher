@@ -12,6 +12,7 @@ mod func;
 mod sparse;
 mod dynamic_partitions;
 mod threaded_writer;
+mod zhlhlf_flow;
 
 use recovery::RecoveryUI;
 use func::{verify_device, package_extract_file, package_extract_targz, package_flash_partition, set_slot};
@@ -29,6 +30,14 @@ fn main() -> Result<()> {
 
     let file = File::open(zip_path).context("Failed to open zip")?;
     let mut archive = ZipArchive::new(file)?;
+
+    // zhlhlf ROM packages run the native flow by default; no updater-script
+    // entry is needed. Set ZHLHLF_AUTO=0 to force the normal script parser.
+    if zhlhlf_flow::auto_enabled() && zhlhlf_flow::is_zhlhlf_rom(&mut archive)? {
+        ui.ui_print("zhlhlf rom detected, running native flash flow")?;
+        zhlhlf_flow::run(&mut ui, &mut archive)?;
+        return Ok(());
+    }
 
     let mut vars: HashMap<String, String> = HashMap::new();
     let slot_suffix = get_active_slot_suffix().unwrap_or_default();
@@ -132,7 +141,14 @@ fn main() -> Result<()> {
                 set_slot(&mut ui, &slot)?;
             },
             "run_program" => {
-                crate::func::run_program(&mut ui, &args)?;
+                if zhlhlf_flow::matches(&args) {
+                    zhlhlf_flow::run(&mut ui, &mut archive)?;
+                } else {
+                    crate::func::run_program(&mut ui, &args)?;
+                }
+            },
+            "zhlhlf" | "zhlhlf_flash" => {
+                zhlhlf_flow::run(&mut ui, &mut archive)?;
             },
             _ => { }
         }

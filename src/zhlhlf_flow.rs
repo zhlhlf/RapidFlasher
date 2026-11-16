@@ -1,0 +1,591 @@
+//! Native port of zhlhlf's shell flashing flow.
+//!
+//! The original flow is a shell `update-binary` (see zhlhlf/android_flash_scripts)
+//! that shells out to `unzip` and `dd` for every image. This module implements the
+//! same steps with the primitives RapidFlasher already has: streaming reads from
+//! the ZIP, `ThreadedWriter` (buffered + fsync), and `ui_print` progress output.
+//!
+//! It is triggered when the update script executes a program whose name contains
+//! "zhlhlf" (see `matches`).
+
+use std::fs::{self, File};
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use zip::ZipArchive;
+
+use crate::recovery::RecoveryUI;
+use crate::threaded_writer::ThreadedWriter;
+
+const PT_DIR: &str = "/dev/block/by-name";
+const FW_DIR: &str = "firmware-update";
+const WORK_DIR: &str = "/data/tmp";
+
+// Test hooks: point the flow at a scratch directory instead of real partitions.
+fn pt_dir() -> String {
+    std::env::var("ZHLHLF_PT_DIR").unwrap_or_else(|_| PT_DIR.to_string())
+}
+
+fn work_dir() -> String {
+    std::env::var("ZHLHLF_WORK_DIR").unwrap_or_else(|_| WORK_DIR.to_string())
+}
+const WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+const SUPER_GROUP: &str = "qti_dynamic_partitions";
+
+/// True when the update script is trying to run zhlhlf's shell flow.
+pub fn matches(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_lowercase().contains("zhlhlf"))
+            .unwrap_or(false)
+    })
+}
+
+/// Auto mode is on unless ZHLHLF_AUTO=0.
+pub fn auto_enabled() -> bool {
+    std::env::var("ZHLHLF_AUTO")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// True when the ZIP is one of zhlhlf's ROM packages, regardless of what the
+/// updater-script says. This is what makes the flow run by default.
+pub fn is_zhlhlf_rom(archive: &mut ZipArchive<File>) -> Result<bool> {
+    let names = collect_entries(archive)?;
+    Ok(is_zhlhlf_names(&names))
+}
+
+fn is_zhlhlf_names(names: &[String]) -> bool {
+    let has_script = names
+        .iter()
+        .any(|n| n.to_lowercase().contains("zhlhlf"));
+    let has_fw = names
+        .iter()
+        .any(|n| n.starts_with(&format!("{}/", FW_DIR)) && n.ends_with(".img"));
+    let has_rom = names.iter().any(|n| {
+        n.starts_with("images/")
+            && (n.ends_with("super.zst")
+                || n.ends_with("super.img")
+                || n.ends_with("system.img"))
+    });
+
+    has_script || (has_fw && has_rom)
+}
+
+pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
+    let names = collect_entries(archive)?;
+    let fw_images: Vec<String> = names
+        .iter()
+        .filter(|n| n.starts_with(&format!("{}/", FW_DIR)) && n.ends_with(".img"))
+        .cloned()
+        .collect();
+    let rom_images: Vec<String> = names
+        .iter()
+        .filter(|n| n.starts_with("images/") && (n.ends_with(".img") || n.ends_with(".zst")))
+        .cloned()
+        .collect();
+
+    let ddr = detect_ddr()?;
+    ui.ui_print(" ")?;
+    ui.ui_print(&format!("you device type is: {}", ddr))?;
+    ui.ui_print("-----------------------------------------")?;
+    ui.ui_print("             Author by zhlhlf")?;
+    ui.ui_print("-----------------------------------------")?;
+
+    let slot = ask_slot(ui, "flash fw  -> a or b?    + is a   ||  - is b")?;
+
+    let work = work_dir();
+    fs::create_dir_all(&work)?;
+
+    // ---- firmware images -------------------------------------------------
+    let has_lp5 = fw_images.iter().any(|e| e == "firmware-update/xbl_lp5.img");
+    if has_lp5 {
+        ui.ui_print("your device is ddr4/ddr5 fw")?;
+        if ddr == "ddr4" {
+            flash_zip_entry(ui, archive, "firmware-update/xbl.img", &part_dest("xbl.img", slot))?;
+            flash_zip_entry(
+                ui,
+                archive,
+                "firmware-update/xbl_config.img",
+                &part_dest("xbl_config.img", slot),
+            )?;
+        } else {
+            flash_zip_entry(
+                ui,
+                archive,
+                "firmware-update/xbl_lp5.img",
+                &part_dest("xbl.img", slot),
+            )?;
+            flash_zip_entry(
+                ui,
+                archive,
+                "firmware-update/xbl_config_lp5.img",
+                &part_dest("xbl_config.img", slot),
+            )?;
+        }
+    }
+
+    for entry in &fw_images {
+        if has_lp5 && basename(entry).starts_with("xbl") {
+            continue;
+        }
+        flash_zip_entry(ui, archive, entry, &part_dest(basename(entry), slot))?;
+    }
+    ui.ui_print(" ")?;
+    ui.ui_print("fw all write done")?;
+    ui.ui_print(" ")?;
+
+    // ---- super / dynamic partitions --------------------------------------
+    if rom_images.iter().any(|e| e == "images/super.zst") {
+        flash_zip_entry_zstd(ui, archive, "images/super.zst", &format!("{}/super", pt_dir()))?;
+    } else if rom_images.iter().any(|e| e == "images/super.img") {
+        // The shell flow wrote this one to `super_<slot>`, but `super` itself is
+        // not slot-suffixed on A/B devices. Keep it unsuffixed.
+        flash_zip_entry(ui, archive, "images/super.img", &format!("{}/super", pt_dir()))?;
+    } else if rom_images.iter().any(|e| e == "images/system.img") {
+        build_and_flash_super(ui, archive, &rom_images)?;
+        ui.ui_print("super write done")?;
+    }
+
+    // ---- boot / vbmeta / dtbo --------------------------------------------
+    if rom_images.iter().any(|e| e == "images/boot.img") {
+        for entry in &rom_images {
+            let name = basename(entry);
+            if name.contains("boot") || name.contains("vbmeta") || name.contains("dtbo") {
+                flash_zip_entry(ui, archive, entry, &part_dest(name, slot))?;
+            }
+        }
+    }
+
+    maybe_format_userdata(ui)?;
+
+    ui.ui_print(" ")?;
+    ui.ui_print("-----------------------------------------")?;
+    ui.ui_print("              all done!")?;
+    ui.ui_print("-----------------------------------------")?;
+    ui.ui_print(" ")?;
+
+    let _ = fs::remove_dir_all(&work);
+    Ok(())
+}
+
+fn collect_entries(archive: &mut ZipArchive<File>) -> Result<Vec<String>> {
+    let mut names = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        names.push(entry.name().to_string());
+    }
+    Ok(names)
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn part_dest(name: &str, slot: char) -> String {
+    let name = name.strip_suffix(".img").unwrap_or(name);
+    format!("{}/{}_{}", pt_dir(), name, slot)
+}
+
+fn detect_ddr() -> Result<String> {
+    if let Ok(text) = fs::read_to_string("/proc/devinfo/ddr_type") {
+        let lower = text.to_lowercase();
+        if lower.contains("ddr4") {
+            return Ok("ddr4".to_string());
+        }
+        if lower.contains("ddr5") {
+            return Ok("ddr5".to_string());
+        }
+    }
+
+    let prop = Command::new("getprop")
+        .arg("ro.boot.ddr_type")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if prop.contains('0') {
+        return Ok("ddr4".to_string());
+    }
+    if prop.contains('1') {
+        return Ok("ddr5".to_string());
+    }
+
+    bail!("ddr get fail");
+}
+
+fn ask_slot(ui: &mut RecoveryUI, prompt: &str) -> Result<char> {
+    ui.ui_print(prompt)?;
+    ui.ui_print(" ")?;
+    let slot = match wait_volume_key(Duration::from_secs(5)) {
+        Some(1) => 'a',
+        Some(0) => 'b',
+        _ => 'a',
+    };
+    ui.ui_print(&format!("selected slot: {}", slot))?;
+    Ok(slot)
+}
+
+/// Returns 1 for VOLUMEUP, 0 for VOLUMEDOWN, None on timeout/unavailable.
+fn wait_volume_key(timeout: Duration) -> Option<u8> {
+    let mut child = Command::new("getevent")
+        .args(["-qlc", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    for line in text.lines() {
+        if line.contains("KEY_VOLUMEUP") && line.contains("DOWN") {
+            return Some(1);
+        }
+        if line.contains("KEY_VOLUMEDOWN") && line.contains("DOWN") {
+            return Some(0);
+        }
+    }
+    None
+}
+
+fn flash_zip_entry(
+    ui: &mut RecoveryUI,
+    archive: &mut ZipArchive<File>,
+    entry: &str,
+    dest: &str,
+) -> Result<()> {
+    ui.ui_print(&format!("flash {} -> {}", basename(entry), basename(dest)))?;
+    let mut source = archive
+        .by_name(entry)
+        .with_context(|| format!("{} not found in zip", entry))?;
+    let mut writer = ThreadedWriter::new(dest.to_string(), WRITE_BUFFER_SIZE);
+    io::copy(&mut source, &mut writer)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn flash_zip_entry_zstd(
+    ui: &mut RecoveryUI,
+    archive: &mut ZipArchive<File>,
+    entry: &str,
+    dest: &str,
+) -> Result<()> {
+    ui.ui_print(&format!("flash {} -> {}", basename(entry), basename(dest)))?;
+    let mut source = archive
+        .by_name(entry)
+        .with_context(|| format!("{} not found in zip", entry))?;
+    let mut writer = ThreadedWriter::new(dest.to_string(), WRITE_BUFFER_SIZE);
+    zstd::stream::copy_decode(&mut source, &mut writer)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn flash_local_file(ui: &mut RecoveryUI, source: &str, dest: &str) -> Result<()> {
+    ui.ui_print(&format!(
+        "flash {} -> {}",
+        basename(source),
+        basename(dest)
+    ))?;
+    let mut input = File::open(source).with_context(|| format!("open {}", source))?;
+    let mut writer = ThreadedWriter::new(dest.to_string(), WRITE_BUFFER_SIZE);
+    io::copy(&mut input, &mut writer)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn extract_to_file(
+    archive: &mut ZipArchive<File>,
+    entry: &str,
+    dest: &str,
+) -> Result<()> {
+    if let Some(parent) = Path::new(dest).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut source = archive
+        .by_name(entry)
+        .with_context(|| format!("{} not found in zip", entry))?;
+    let mut writer = ThreadedWriter::new(dest.to_string(), WRITE_BUFFER_SIZE);
+    io::copy(&mut source, &mut writer)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn build_and_flash_super(
+    ui: &mut RecoveryUI,
+    archive: &mut ZipArchive<File>,
+    rom_images: &[String],
+) -> Result<()> {
+    check_data_size()?;
+
+    let slot = ask_slot(ui, "flash rom  -> a or b?    + is a   ||  - is b")?;
+    let project_dir = format!("{}/project/images", work_dir());
+    fs::create_dir_all(&project_dir)?;
+
+    ui.ui_print("extract images/* ...")?;
+    for entry in rom_images {
+        let name = basename(entry);
+        if name == "super.img" || name == "super.zst" || !name.ends_with(".img") {
+            continue;
+        }
+        extract_to_file(archive, entry, &format!("{}/{}", project_dir, name))?;
+    }
+
+    // Partition payloads that live inside super. boot/vbmeta/dtbo are flashed
+    // to their own partitions later, exactly like the shell flow does.
+    let mut parts: Vec<(String, String, u64)> = Vec::new();
+    for entry in rom_images {
+        let name = basename(entry);
+        if !name.ends_with(".img") || name == "super.img" {
+            continue;
+        }
+        if name.starts_with("boot")
+            || name.starts_with("vbmeta")
+            || name.starts_with("dtbo")
+        {
+            continue;
+        }
+        let part = name.trim_end_matches(".img").to_string();
+        let path = format!("{}/{}", project_dir, name);
+        let size = fs::metadata(&path)
+            .with_context(|| format!("stat {}", path))?
+            .len();
+        parts.push((part, path, size));
+    }
+
+    if parts.is_empty() {
+        bail!("no images found to build super");
+    }
+
+    let device_size = query_super_size()?;
+    let group_size = device_size.saturating_sub(1024 * 1024);
+    let lpmake = extract_lpmake(archive)?;
+    let output = format!("{}/project/super.img", work_dir());
+
+    let mut args: Vec<String> = vec![
+        "--metadata-size".into(),
+        "65536".into(),
+        "--super-name".into(),
+        "super".into(),
+        "--device".into(),
+        format!("super:{}", device_size),
+        "--metadata-slots".into(),
+        "3".into(),
+        "--virtual-ab".into(),
+        "--group".into(),
+        format!("{}_a:{}", SUPER_GROUP, group_size),
+        "--group".into(),
+        format!("{}_b:{}", SUPER_GROUP, group_size),
+    ];
+
+    let (active, inactive) = match slot {
+        'a' => ("a", "b"),
+        _ => ("b", "a"),
+    };
+
+    for (name, path, size) in &parts {
+        ui.ui_print(&format!(
+            "  - {} size {}",
+            name, size
+        ))?;
+        args.push("--partition".into());
+        args.push(format!("{}_{}:none:{}:{}_{}", name, active, size, SUPER_GROUP, active));
+        args.push("--image".into());
+        args.push(format!("{}_{}={}", name, active, path));
+        args.push("--partition".into());
+        args.push(format!("{}_{}:none:0:{}_{}", name, inactive, SUPER_GROUP, inactive));
+    }
+
+    args.push("-F".into());
+    args.push("--output".into());
+    args.push(output.clone());
+
+    let log_path = format!("{}/project/make_super.txt", work_dir());
+    let log = File::create(&log_path)?;
+    let log_err = log.try_clone()?;
+    let status = Command::new(&lpmake)
+        .args(&args)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .status()
+        .context("failed to run lpmake")?;
+
+    if !status.success() || !Path::new(&output).exists() {
+        let text = fs::read_to_string(&log_path).unwrap_or_default();
+        for line in text.lines() {
+            let _ = ui.ui_print(line);
+        }
+        bail!("make super fail");
+    }
+
+    ui.ui_print("super built, flashing...")?;
+    flash_local_file(ui, &output, &format!("{}/super", pt_dir()))
+}
+
+fn check_data_size() -> Result<()> {
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        let path = b"/data\0";
+        if libc::statvfs(path.as_ptr() as *const libc::c_char, &mut stat) != 0 {
+            bail!("data mount fail");
+        }
+        let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+        if free < 20 * 1024 * 1024 * 1024 {
+            bail!("data mount fail: need more than 20G free on /data");
+        }
+    }
+    Ok(())
+}
+
+fn query_super_size() -> Result<u64> {
+    if let Ok(out) = Command::new("blockdev")
+        .args(["--getsize64", "/dev/block/by-name/super"])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(size) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                return Ok(size);
+            }
+        }
+    }
+
+    if let Ok(out) = Command::new("sgdisk")
+        .args(["/dev/block/sda", "--print"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 && fields.iter().any(|f| *f == "super") {
+                if let (Ok(start), Ok(end)) = (fields[1].parse::<u64>(), fields[2].parse::<u64>()) {
+                    return Ok((end.saturating_sub(start) + 1) * 4096);
+                }
+            }
+        }
+    }
+
+    bail!("cannot determine super partition size")
+}
+
+fn extract_lpmake(archive: &mut ZipArchive<File>) -> Result<String> {
+    let dest = "/tmp/lpmake";
+    if Path::new(dest).exists() {
+        return Ok(dest.to_string());
+    }
+
+    for entry in ["META-INF/bin/lptools/lpmake", "scripts/lpmake"] {
+        if archive.by_name(entry).is_ok() {
+            extract_to_file(archive, entry, dest)?;
+            let mut perms = fs::metadata(dest)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(dest, perms)?;
+            return Ok(dest.to_string());
+        }
+    }
+
+    bail!("lpmake not found in zip")
+}
+
+fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
+    let mke2fs = ["/system/bin/mke2fs", "/sbin/mke2fs", "/system/bin/mke2fs.recovery"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|p| p.to_string());
+
+    let mke2fs = match mke2fs {
+        Some(path) => path,
+        None => {
+            ui.ui_print("mke2fs not found, skip format userdata")?;
+            return Ok(());
+        }
+    };
+
+    ui.ui_print(" ")?;
+    ui.ui_print("format userdata to ext4?")?;
+    ui.ui_print("  + (VOLUMEUP)   = format (ERASE ALL DATA)")?;
+    ui.ui_print("  - (VOLUMEDOWN) = skip")?;
+    ui.ui_print("  (5s timeout -> skip)")?;
+    ui.ui_print(" ")?;
+
+    if wait_volume_key(Duration::from_secs(5)) != Some(1) {
+        ui.ui_print("skip format userdata")?;
+        return Ok(());
+    }
+
+    ui.ui_print("WARNING: this will ERASE ALL userdata!")?;
+    ui.ui_print("press VOLUMEUP again to confirm, VOLUMEDOWN to cancel")?;
+    if wait_volume_key(Duration::from_secs(5)) != Some(1) {
+        ui.ui_print("cancel format userdata")?;
+        return Ok(());
+    }
+
+    ui.ui_print("formatting userdata (ext4) ...")?;
+    let status = Command::new(&mke2fs)
+        .args(["-t", "ext4", "/dev/block/by-name/userdata"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => ui.ui_print("format userdata ok")?,
+        _ => ui.ui_print("format userdata fail")?,
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_only_zhlhlf() {
+        assert!(matches(&[
+            "/tmp/scripts/zhlhlf".to_string(),
+            "3".to_string()
+        ]));
+        assert!(matches(&["/tmp/zhlhlf".to_string()]));
+        assert!(matches(&["sh".to_string(), "scripts/zhlhlf".to_string()]));
+        assert!(!matches(&["/tmp/busybox".to_string(), "sh".to_string()]));
+    }
+
+    #[test]
+    fn partition_destination_keeps_slot() {
+        assert_eq!(part_dest("xbl.img", 'a'), "/dev/block/by-name/xbl_a");
+        assert_eq!(part_dest("boot", 'b'), "/dev/block/by-name/boot_b");
+        assert_eq!(basename("firmware-update/xbl.img"), "xbl.img");
+    }
+
+    #[test]
+    fn detects_zhlhlf_rom_layout() {
+        let names = vec![
+            "firmware-update/xbl.img".to_string(),
+            "images/super.zst".to_string(),
+        ];
+        assert!(is_zhlhlf_names(&names));
+
+        let script_only = vec!["scripts/zhlhlf".to_string()];
+        assert!(is_zhlhlf_names(&script_only));
+
+        let fw_only = vec!["firmware-update/xbl.img".to_string()];
+        assert!(!is_zhlhlf_names(&fw_only));
+    }
+}
