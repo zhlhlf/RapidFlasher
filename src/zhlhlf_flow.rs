@@ -516,7 +516,7 @@ fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
 
     ui.ui_print("formatting userdata (ext4) ...")?;
     let status = Command::new(&mke2fs)
-        .args(["-t", "ext4", "/dev/block/by-name/userdata"])
+        .args(["-t", "ext4", "-F", "/dev/block/mapper/userdata"])
         .status();
 
     match status {
