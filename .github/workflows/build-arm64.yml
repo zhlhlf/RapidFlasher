@@ -82,16 +82,23 @@ jobs:
           NAME: ${{ steps.rel.outputs.name }}
         run: |
           set -euo pipefail
-          NOTES="Manual build of ${GITHUB_SHA} on ${GITHUB_REF_NAME}.\n\n\`\`\`\n$(cat dist/update-binary.sha256)\n\`\`\`"
+          {
+            printf 'Manual build of %s on %s.\n\n' "$GITHUB_SHA" "$GITHUB_REF_NAME"
+            printf '```\n'
+            cat dist/update-binary.sha256
+            printf '```\n'
+          } > notes.md
+          cat notes.md
           if gh release view "$NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $NAME exists, uploading assets"
+            echo "release $NAME exists, updating"
+            gh release edit "$NAME" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
             gh release upload "$NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$NAME" dist/* \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$NAME" \
-              --notes "$NOTES"
+              --notes-file notes.md
           fi
           gh release view "$NAME" --repo "$GITHUB_REPOSITORY" --json tagName,name,url --jq '"tag=\(.tagName) name=\(.name) \(.url)"'
 
