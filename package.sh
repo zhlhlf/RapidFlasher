@@ -30,11 +30,7 @@ mkdir -p "$base"
 cp "$BIN" "$base/update-binary"
 chmod 755 "$base/update-binary"
 
-cat > "$base/updater-script" <<'SCRIPT'
-ui_print "RapidFlasher"
-ui_print "Running zhlhlf flash flow..."
-zhlhlf_flow
-SCRIPT
+printf 'zhlhlf_flow\n' > "$base/updater-script"
 
 mkdir -p "$OUT_DIR"
 zip_path="$OUT_DIR/update-binary-${name}.zip"
