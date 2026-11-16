@@ -31,14 +31,6 @@ fn main() -> Result<()> {
     let file = File::open(zip_path).context("Failed to open zip")?;
     let mut archive = ZipArchive::new(file)?;
 
-    // zhlhlf ROM packages run the native flow by default; no updater-script
-    // entry is needed. Set ZHLHLF_AUTO=0 to force the normal script parser.
-    if zhlhlf_flow::auto_enabled() && zhlhlf_flow::is_zhlhlf_rom(&mut archive)? {
-        ui.ui_print("zhlhlf rom detected, running native flash flow")?;
-        zhlhlf_flow::run(&mut ui, &mut archive)?;
-        return Ok(());
-    }
-
     let mut vars: HashMap<String, String> = HashMap::new();
     let slot_suffix = get_active_slot_suffix().unwrap_or_default();
     vars.insert("SLOT".to_string(), slot_suffix);
@@ -147,7 +139,7 @@ fn main() -> Result<()> {
                     crate::func::run_program(&mut ui, &args)?;
                 }
             },
-            "zhlhlf" | "zhlhlf_flash" => {
+            "zhlhlf" | "zhlhlf_flash" | "zhlhlf_flow" => {
                 zhlhlf_flow::run(&mut ui, &mut archive)?;
             },
             _ => { }

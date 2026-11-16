@@ -62,6 +62,8 @@ jobs:
           cp "target/$TARGET/release/update-binary" dist/
           (cd dist && sha256sum update-binary > update-binary.sha256)
           cat dist/update-binary.sha256
+          bash package.sh "target/$TARGET/release/update-binary" dist "${GITHUB_SHA:0:8}"
+          ls -l dist
 
       - name: Resolve release name
         id: rel

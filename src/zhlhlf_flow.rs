@@ -37,6 +37,11 @@ const WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const SUPER_GROUP: &str = "qti_dynamic_partitions";
 
 /// True when the update script is trying to run zhlhlf's shell flow.
+///
+/// The flow is started from `updater-script` only: the bare commands
+/// `zhlhlf`, `zhlhlf_flash` and `zhlhlf_flow`, or a `run_program` whose
+/// argument basename contains `zhlhlf`. ZIP contents are never inspected to
+/// decide this.
 pub fn matches(args: &[String]) -> bool {
     args.iter().any(|arg| {
         Path::new(arg)
@@ -45,37 +50,6 @@ pub fn matches(args: &[String]) -> bool {
             .map(|name| name.to_lowercase().contains("zhlhlf"))
             .unwrap_or(false)
     })
-}
-
-/// Auto mode is on unless ZHLHLF_AUTO=0.
-pub fn auto_enabled() -> bool {
-    std::env::var("ZHLHLF_AUTO")
-        .map(|v| v != "0")
-        .unwrap_or(true)
-}
-
-/// True when the ZIP is one of zhlhlf's ROM packages, regardless of what the
-/// updater-script says. This is what makes the flow run by default.
-pub fn is_zhlhlf_rom(archive: &mut ZipArchive<File>) -> Result<bool> {
-    let names = collect_entries(archive)?;
-    Ok(is_zhlhlf_names(&names))
-}
-
-fn is_zhlhlf_names(names: &[String]) -> bool {
-    let has_script = names
-        .iter()
-        .any(|n| n.to_lowercase().contains("zhlhlf"));
-    let has_fw = names
-        .iter()
-        .any(|n| n.starts_with(&format!("{}/", FW_DIR)) && n.ends_with(".img"));
-    let has_rom = names.iter().any(|n| {
-        n.starts_with("images/")
-            && (n.ends_with("super.zst")
-                || n.ends_with("super.img")
-                || n.ends_with("system.img"))
-    });
-
-    has_script || (has_fw && has_rom)
 }
 
 pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
@@ -574,18 +548,4 @@ mod tests {
         assert_eq!(basename("firmware-update/xbl.img"), "xbl.img");
     }
 
-    #[test]
-    fn detects_zhlhlf_rom_layout() {
-        let names = vec![
-            "firmware-update/xbl.img".to_string(),
-            "images/super.zst".to_string(),
-        ];
-        assert!(is_zhlhlf_names(&names));
-
-        let script_only = vec!["scripts/zhlhlf".to_string()];
-        assert!(is_zhlhlf_names(&script_only));
-
-        let fw_only = vec!["firmware-update/xbl.img".to_string()];
-        assert!(!is_zhlhlf_names(&fw_only));
-    }
 }

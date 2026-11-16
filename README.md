@@ -154,14 +154,29 @@ cargo build --release --target aarch64-linux-android
 
 The result is `target/aarch64-linux-android/release/update-binary`.
 
+### Packaging ###
+`./package.sh [binary] [out_dir] [name]` wraps the binary into a minimal flashable ZIP:
+
+````
+update-binary-<sha8>.zip
+└── META-INF
+    └── com
+        └── google
+            └── android
+                ├── update-binary    <-- compiled binary
+                └── updater-script   <-- calls zhlhlf_flow
+````
+
+Drop your `firmware-update/` and `images/` payloads next to `META-INF` and the ZIP is ready to flash. The default name is the first 8 characters of the commit SHA.
+
 ### CI ###
-`.github/workflows/build-arm64.yml` builds `aarch64-linux-android` on every push, pull request and manual dispatch. The binary plus its `.sha256` are uploaded as the `update-binary-arm64` artifact.
+`.github/workflows/build-arm64.yml` builds `aarch64-linux-android` on every push, pull request and manual dispatch. The flashable ZIP, the raw binary and its `.sha256` are uploaded as the `update-binary-arm64` artifact.
 
 Releases:
 
 | Trigger | Result |
 |---|---|
-| Manual dispatch (`workflow_dispatch`) | GitHub Release named after the first **8 characters of the commit SHA** (e.g. `78a8275`), with `update-binary` and `update-binary.sha256` attached. Re-running the same commit overwrites the assets. |
+| Manual dispatch (`workflow_dispatch`) | GitHub Release named after the first **8 characters of the commit SHA** (e.g. `78a8275`). Assets: `update-binary-<sha8>.zip` (with `META-INF/com/google/android/{update-binary,updater-script}`), the raw `update-binary`, and `update-binary.sha256`. Re-running the same commit overwrites the assets. |
 | Tag push `v*` | GitHub Release on that tag, same assets. |
 
 Builds from ordinary pushes and pull requests only produce an artifact — no release.
