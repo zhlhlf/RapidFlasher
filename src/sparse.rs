@@ -86,6 +86,9 @@ pub fn flash_sparse(
     }
     
     writer.flush()?;
+    // Flush the device write cache too; otherwise a reboot right after
+    // flashing may lose the tail of the image.
+    writer.get_ref().sync_all()?;
     
     Ok(())
 }

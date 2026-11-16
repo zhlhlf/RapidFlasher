@@ -21,6 +21,9 @@ impl ThreadedWriter {
                 writer.write_all(&chunk)?;
             }
             writer.flush()?;
+            // Make sure the data (and the device write cache) is flushed before we
+            // hand control back. A plain flush only reaches the kernel page cache.
+            writer.get_ref().sync_all()?;
             Ok(())
         });
 
@@ -33,7 +36,10 @@ impl ThreadedWriter {
     pub fn finish(mut self) -> Result<()> {
         drop(self.sender.take());
         if let Some(h) = self.handle.take() {
-            h.join().unwrap()?;
+            match h.join() {
+                Ok(result) => result?,
+                Err(_) => return Err(anyhow::anyhow!("writer thread panicked")),
+            }
         }
         Ok(())
     }
