@@ -89,5 +89,73 @@ package_extract_file "boot.img" "/dev/block/bootdevice/by-name/boot${SLOT}"
 package_extract_targz "oplus.tar.gz" "/data/oplus-partitions"
 ````
 
+***
+## zhlhlf ROM Flow ##
+This binary ships a native implementation of the [zhlhlf](https://github.com/zhlhlf/android_flash_scripts) flash flow (the `update-binary`-less shell installer used by OnePlus/Oplus-style ROM packages). It does everything in-process: no `unzip`, no `dd`, no external shell scripts.
+
+### Triggering ###
+By default the flow runs **automatically** — no `updater-script` entry needed. After opening the ZIP the binary inspects the entry list; if it looks like a zhlhlf ROM package it takes over immediately and never reads `updater-script`.
+
+A ZIP is detected as a zhlhlf ROM when either of these is true:
+
+| Condition | Example |
+|---|---|
+| Any entry name contains `zhlhlf` | `scripts/zhlhlf`, `META-INF/com/google/android/updater-script-zhlhlf` |
+| Both `firmware-update/*.img` **and** a ROM image under `images/` exist | `firmware-update/xbl.img` + `images/super.zst` |
+
+The `images/` file must be one of `super.zst`, `super.img`, or `system.img`.
+
+Recovery log then starts with:
+
+````
+ui_print zhlhlf rom detected, running native flash flow
+````
+
+#### Manual / explicit trigger ####
+Kept for compatibility; not required for normal use.
+
+- A `run_program` argument whose basename contains `zhlhlf`:
+  ````shell
+  run_program "/tmp/scripts/zhlhlf" "3" "1" "rom.zip"
+  ````
+  Note: arguments are whitespace separated. The shell function form `run_program("...")` is **not** parsed and the flow will not start.
+- A bare `zhlhlf` or `zhlhlf_flash` command anywhere in `updater-script`.
+
+#### Disabling auto-detection ####
+Set `ZHLHLF_AUTO=0` in the recovery environment to restore the normal `updater-script` parser.
+
+### What the flow does ###
+1. **DDR type** — reads `/proc/devinfo/ddr_type`, falling back to `getprop ro.boot.ddr_type` (`0` = DDR4, `1` = DDR5).
+2. **Slot select** — `getevent -qlc 1` watches the volume keys for 5 seconds; timeout defaults to slot `a`.
+3. **Firmware** — every `firmware-update/*.img` is streamed to `/dev/block/by-name/<name>_<slot>`. When `xbl_lp5.img` is present, `xbl`/`xbl_config` are chosen by DDR type and the other variants are skipped.
+4. **super** — `images/super.zst` is decompressed on the fly straight into `super`; `images/super.img` is written as-is (no slot suffix).
+5. **super from system.img** — if only `images/system.img` exists, `super` is assembled with `lpmake` from inside the ZIP: `--metadata-size 65536`, group `qti_dynamic_partitions`, `--metadata-slots 3`, virtual A/B, inactive slot sized 0, and `boot`/`vbmeta`/`dtbo` excluded (they get their own partitions).
+6. **boot / vbmeta / dtbo** — written to their own partitions with the selected slot.
+7. **userdata** — optionally formatted with `mke2fs -t ext4`.
+
+Every write goes through the same buffered writer used by the rest of the binary (16 MB buffer) and ends with an `fsync(2)` on that target before returning.
+
+### Build with the zhlhlf flow ###
+Same as any other target of this project — see [Build](#build). No extra feature flags.
+
+***
+## Build ##
+
+### Local (Android arm64) ###
+Requires Rust (edition 2024 ⇒ 1.85+) and an Android NDK.
+
+````shell
+rustup target add aarch64-linux-android
+export NDK=$ANDROID_NDK_HOME
+export CC_aarch64_linux_android="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+export AR_aarch64_linux_android="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+cargo build --release --target aarch64-linux-android
+````
+
+The result is `target/aarch64-linux-android/release/update-binary`.
+
+### CI ###
+`.github/workflows/build-arm64.yml` builds `aarch64-linux-android` on every push, pull request and manual dispatch. The binary plus its `.sha256` are uploaded as the `update-binary-arm64` artifact; pushing a `v*` tag also attaches them to a GitHub release.
+
 ## Note ##
 You can remove `META-INF/bin/lptools` if you don't plan on using `dynamic_partitions_op_list`

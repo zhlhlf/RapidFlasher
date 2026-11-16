@@ -1,0 +1,73 @@
+name: build-arm64
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: aarch64-linux-android
+  API: 21
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+          rustc --version
+
+      - name: Locate Android NDK
+        id: ndk
+        run: |
+          set -euo pipefail
+          for base in "$ANDROID_NDK_LATEST_HOME" "$ANDROID_NDK_HOME" "$ANDROID_NDK_ROOT" \
+                      /usr/local/lib/android/sdk/ndk/*; do
+            [ -n "${base:-}" ] || continue
+            [ -d "$base/toolchains/llvm/prebuilt/linux-x86_64/bin" ] || continue
+            echo "ndk=$base" >> "$GITHUB_OUTPUT"
+            echo "using NDK: $base"
+            exit 0
+          done
+          echo "no NDK found" >&2
+          exit 1
+
+      - name: Build
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk }}
+        run: |
+          set -euo pipefail
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android${API}-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          cargo build --release --target "$TARGET" --locked
+          ls -lh "target/$TARGET/release/update-binary"
+          file "target/$TARGET/release/update-binary"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET/release/update-binary" dist/
+          (cd dist && sha256sum update-binary > update-binary.sha256)
+          cat dist/update-binary.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-binary-arm64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
