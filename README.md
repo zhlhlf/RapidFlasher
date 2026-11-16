@@ -155,7 +155,16 @@ cargo build --release --target aarch64-linux-android
 The result is `target/aarch64-linux-android/release/update-binary`.
 
 ### CI ###
-`.github/workflows/build-arm64.yml` builds `aarch64-linux-android` on every push, pull request and manual dispatch. The binary plus its `.sha256` are uploaded as the `update-binary-arm64` artifact; pushing a `v*` tag also attaches them to a GitHub release.
+`.github/workflows/build-arm64.yml` builds `aarch64-linux-android` on every push, pull request and manual dispatch. The binary plus its `.sha256` are uploaded as the `update-binary-arm64` artifact.
+
+Releases:
+
+| Trigger | Result |
+|---|---|
+| Manual dispatch (`workflow_dispatch`) | GitHub Release named after the first **8 characters of the commit SHA** (e.g. `78a8275`), with `update-binary` and `update-binary.sha256` attached. Re-running the same commit overwrites the assets. |
+| Tag push `v*` | GitHub Release on that tag, same assets. |
+
+Builds from ordinary pushes and pull requests only produce an artifact — no release.
 
 ## Note ##
 You can remove `META-INF/bin/lptools` if you don't plan on using `dynamic_partitions_op_list`
