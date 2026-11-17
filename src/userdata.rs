@@ -34,6 +34,8 @@ const CRYPT_MAGIC: u32 = 0xF0D1_B4C0;
 /// `_IOR(0x12, 114, size_t)` on a 64-bit kernel.
 const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
 const MNT_DETACH: libc::c_int = 2;
+/// `_IO(0x12, 119)`: discard a byte range on a block device.
+const BLKDISCARD: libc::c_ulong = 0x1277;
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// ext4 superblock starts at 1024, `s_magic` at offset 0x38 in it.
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
@@ -41,10 +43,24 @@ const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
 /// Prefer the device-mapper node: on metadata-encrypted userdata the
 /// encryption layer must stay in place, so formatting the physical
 /// partition underneath would write plaintext.
+#[allow(dead_code)]
 const USERDATA_CANDIDATES: [&str; 3] = [
     "/dev/block/mapper/userdata",
     "/dev/block/by-name/userdata",
     "/dev/block/bootdevice/by-name/userdata",
+];
+
+/// For a full reset we want the raw layer, not a metadata-encryption mapper.
+const RAW_USERDATA_CANDIDATES: [&str; 3] = [
+    "/dev/block/by-name/userdata",
+    "/dev/block/bootdevice/by-name/userdata",
+    "/dev/block/mapper/userdata",
+];
+
+const METADATA_CANDIDATES: [&str; 3] = [
+    "/dev/block/mapper/metadata",
+    "/dev/block/by-name/metadata",
+    "/dev/block/bootdevice/by-name/metadata",
 ];
 
 /// Mount points that keep `/data` busy. External SD cards live under
@@ -53,6 +69,7 @@ fn is_data_mount(mount_point: &str) -> bool {
     mount_point == "/data"
         || mount_point.starts_with("/data/")
         || mount_point == "/metadata"
+        || mount_point == "/cache"
         || mount_point == "/sdcard"
         || mount_point.starts_with("/storage/emulated")
         || mount_point.starts_with("/storage/self")
@@ -120,10 +137,14 @@ fn unmount_data(ui: &mut RecoveryUI) -> Result<()> {
     Ok(())
 }
 
-fn open_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
+fn open_block_device(
+    candidates: &[&str],
+    label: &str,
+    ui: &mut RecoveryUI,
+) -> Result<(File, PathBuf)> {
     let mut errors = Vec::new();
 
-    for candidate in USERDATA_CANDIDATES {
+    for candidate in candidates {
         match OpenOptions::new().read(true).write(true).open(candidate) {
             Ok(file) => {
                 let is_block = file
@@ -134,14 +155,125 @@ fn open_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
                     errors.push(format!("{}: not a block device", candidate));
                     continue;
                 }
-                ui.ui_print(&format!("userdata device: {}", candidate))?;
+                ui.ui_print(&format!("{} device: {}", label, candidate))?;
                 return Ok((file, PathBuf::from(candidate)));
             }
             Err(err) => errors.push(format!("{}: {}", candidate, err)),
         }
     }
 
-    bail!("cannot open userdata block device ({})", errors.join("; "))
+    bail!("cannot open {} block device ({})", label, errors.join("; "))
+}
+
+#[allow(dead_code)]
+fn open_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
+    open_block_device(&USERDATA_CANDIDATES, "userdata", ui)
+}
+
+fn open_metadata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
+    open_block_device(&METADATA_CANDIDATES, "metadata", ui)
+}
+
+
+fn dm_attr(name: &str, attr: &str) -> Option<String> {
+    fs::read_to_string(format!("/sys/class/block/{}/dm/{}", name, attr))
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+fn dm_slaves(name: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(format!("/sys/class/block/{}/slaves", name)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let slave = entry.file_name().to_string_lossy().into_owned();
+            let path = PathBuf::from(format!("/dev/block/{}", slave));
+            path.exists().then_some(path)
+        })
+        .collect()
+}
+
+fn is_super_device(path: &Path) -> bool {
+    let Ok(super_path) = fs::canonicalize("/dev/block/by-name/super") else {
+        return false;
+    };
+    fs::canonicalize(path)
+        .map(|candidate| candidate == super_path)
+        .unwrap_or(false)
+}
+
+/// Resolve the raw (plaintext) userdata layer. If the best candidate is a
+/// dm-crypt / dm-default-key mapping, use its slave instead; a dm-linear
+/// node is already the raw layer for a logical partition.
+fn raw_userdata_layer(candidate: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(candidate)
+        .with_context(|| format!("cannot resolve {}", candidate))?;
+    let Some(name) = canonical.file_name().and_then(|name| name.to_str()) else {
+        bail!("bad block device path {}", candidate);
+    };
+    if !name.starts_with("dm-") {
+        return Ok(canonical);
+    }
+
+    let uuid = dm_attr(name, "uuid").unwrap_or_default();
+    let encrypted = uuid.starts_with("CRYPT-") || uuid.starts_with("default-key");
+    if !encrypted {
+        // dm-linear for a logical partition: this is the raw layer.
+        return Ok(canonical);
+    }
+
+    let mut only_super = false;
+    for slave in dm_slaves(name) {
+        if is_super_device(&slave) {
+            only_super = true;
+            continue;
+        }
+        return Ok(slave);
+    }
+
+    if only_super {
+        bail!(
+            "{} is an encryption mapping over the super partition; refusing to wipe it",
+            candidate
+        );
+    }
+    bail!("{} is an encryption mapping but has no usable slave", candidate)
+}
+
+fn open_raw_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
+    let mut errors = Vec::new();
+
+    for candidate in RAW_USERDATA_CANDIDATES {
+        if !Path::new(candidate).exists() {
+            continue;
+        }
+        let raw = match raw_userdata_layer(candidate) {
+            Ok(raw) => raw,
+            Err(err) => {
+                errors.push(format!("{}: {err:#}", candidate));
+                continue;
+            }
+        };
+        match OpenOptions::new().read(true).write(true).open(&raw) {
+            Ok(file) => {
+                let is_block = file
+                    .metadata()
+                    .map(|meta| meta.file_type().is_block_device())
+                    .unwrap_or(false);
+                if !is_block {
+                    errors.push(format!("{}: not a block device", raw.display()));
+                    continue;
+                }
+                ui.ui_print(&format!("raw userdata device: {}", raw.display()))?;
+                return Ok((file, raw));
+            }
+            Err(err) => errors.push(format!("{}: {}", raw.display(), err)),
+        }
+    }
+
+    bail!("cannot open raw userdata device ({})", errors.join("; "))
 }
 
 fn block_size(file: &File) -> Result<u64> {
@@ -183,6 +315,45 @@ fn has_crypt_footer(file: &mut File, size: u64) -> Result<bool> {
 fn wipe_crypt_footer(file: &mut File, size: u64) -> Result<()> {
     file.seek(SeekFrom::Start(size - CRYPT_FOOTER_OFFSET))?;
     file.write_all(&[0u8; CRYPT_FOOTER_OFFSET as usize])?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Discard the whole partition, falling back to writing zeros. This is the
+/// AOSP `wipe_block_device` behaviour used for metadata-encrypted userdata:
+/// leave no filesystem behind, let Android encrypt-in-place on next boot.
+fn wipe_raw(ui: &mut RecoveryUI, file: &mut File, size: u64) -> Result<()> {
+    let range: [u64; 2] = [0, size];
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), BLKDISCARD as _, range.as_ptr()) };
+    if rc == 0 {
+        ui.ui_print("BLKDISCARD ok")?;
+        let _ = file.sync_all();
+        return Ok(());
+    }
+
+    ui.ui_print(&format!(
+        "BLKDISCARD failed ({}), zeroing the whole partition ...",
+        io::Error::last_os_error()
+    ))?;
+
+    const CHUNK: usize = 16 * 1024 * 1024;
+    let zeros = vec![0u8; CHUNK];
+    file.seek(SeekFrom::Start(0))?;
+    let mut done = 0u64;
+    let mut next_report = 4 * 1024 * 1024 * 1024u64;
+    while done < size {
+        let n = std::cmp::min(CHUNK as u64, size - done) as usize;
+        file.write_all(&zeros[..n])?;
+        done += n as u64;
+        if done >= next_report {
+            ui.ui_print(&format!(
+                "  zeroed {} / {} MiB",
+                done / 1024 / 1024,
+                size / 1024 / 1024
+            ))?;
+            next_report += 4 * 1024 * 1024 * 1024;
+        }
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -271,7 +442,7 @@ fn verify_ext4(file: &mut File) -> Result<bool> {
     Ok(u16::from_le_bytes(magic) == EXT4_SUPER_MAGIC)
 }
 
-fn restore_contexts(ui: &mut RecoveryUI, device: &Path) -> Result<()> {
+fn restore_contexts(ui: &mut RecoveryUI, device: &Path, mount_point: &str) -> Result<()> {
     let Some(e2fsdroid) = find_tool(&["e2fsdroid"]) else {
         ui.ui_print("e2fsdroid not found, skip SELinux restore")?;
         return Ok(());
@@ -288,7 +459,7 @@ fn restore_contexts(ui: &mut RecoveryUI, device: &Path) -> Result<()> {
     };
 
     let output = Command::new(e2fsdroid)
-        .args(["-e", "-S", file_contexts, "-a", "/data"])
+        .args(["-e", "-S", file_contexts, "-a", mount_point])
         .arg(device)
         .output()
         .context("failed to run e2fsdroid")?;
@@ -303,7 +474,8 @@ fn restore_contexts(ui: &mut RecoveryUI, device: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Format `/data` the way TWRP's "Format Data" does.
+/// Format `/data` the way TWRP's "Format Data" does (keeps encryption).
+#[allow(dead_code)]
 pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print("unmounting /data and emulated storage ...")?;
     unmount_data(ui)?;
@@ -342,8 +514,67 @@ pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
     }
     ui.ui_print("ext4 superblock verified")?;
 
-    restore_contexts(ui, &device_path)?;
+    restore_contexts(ui, &device_path, "/data")?;
     ui.ui_print("format userdata ok")?;
+    Ok(())
+}
+
+/// Full reset: raw-wipe userdata, then format metadata. Order matters:
+/// AOSP wipes data first and metadata last, so a power loss in between leaves
+/// the old metadata key with a zeroed data partition (recoverable) instead of
+/// a new key with old ciphertext (unbootable).
+pub fn full_reset(ui: &mut RecoveryUI) -> Result<()> {
+    ui.ui_print("FULL RESET: raw-wipe userdata, then format metadata")?;
+    ui.ui_print("unmounting /data, /metadata and emulated storage ...")?;
+    unmount_data(ui)?;
+
+    let (mut data, data_path) = open_raw_userdata(ui)?;
+    let data_size = block_size(&data)?;
+    if data_size < 64 * 1024 * 1024 {
+        bail!("userdata too small: {} bytes", data_size);
+    }
+
+    // Open metadata before touching userdata, so a missing metadata partition
+    // aborts the reset instead of leaving data wiped with no way to finish.
+    let (mut metadata, metadata_path) = open_metadata(ui)?;
+    let metadata_size = block_size(&metadata)?;
+    let blocks = metadata_size / 4096;
+    if blocks < 1024 {
+        bail!("metadata too small: {} bytes", metadata_size);
+    }
+    if fs::canonicalize(&data_path).ok() == fs::canonicalize(&metadata_path).ok() {
+        bail!(
+            "userdata and metadata resolve to the same device ({}), refusing",
+            data_path.display()
+        );
+    }
+
+    ui.ui_print(&format!(
+        "raw-wiping userdata {} ({} MiB) ...",
+        data_path.display(),
+        data_size / 1024 / 1024
+    ))?;
+    wipe_raw(ui, &mut data, data_size)?;
+    drop(data);
+    ui.ui_print("userdata raw wipe ok")?;
+
+    ui.ui_print(&format!(
+        "formatting metadata {} ({} MiB, ext4) ...",
+        metadata_path.display(),
+        metadata_size / 1024 / 1024
+    ))?;
+    mkfs(ui, &metadata_path, blocks)?;
+
+    if !verify_ext4(&mut metadata)? {
+        bail!(
+            "ext4 superblock missing on metadata {}",
+            metadata_path.display()
+        );
+    }
+    ui.ui_print("metadata ext4 verified")?;
+
+    restore_contexts(ui, &metadata_path, "/metadata")?;
+    ui.ui_print("FULL RESET done: reboot so Android can create a new metadata key")?;
     Ok(())
 }
 

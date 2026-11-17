@@ -209,39 +209,56 @@ fn ask_slot(ui: &mut RecoveryUI, prompt: &str) -> Result<char> {
 
 /// Returns 1 for VOLUMEUP, 0 for VOLUMEDOWN, None on timeout/unavailable.
 fn wait_volume_key(timeout: Duration) -> Option<u8> {
-    let mut child = Command::new("getevent")
-        .args(["-qlc", "1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let deadline = Instant::now() + timeout;
 
-    let started = Instant::now();
+    // `getevent -c 1` exits after the first input event, which may be a key
+    // release, a touch event or a SYN_REPORT rather than the press we want.
+    // Keep a fresh listener running until the deadline and ignore anything
+    // that is not a volume-key press.
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(_) => break,
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
         }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        let remaining = deadline - now;
 
-    let output = child.wait_with_output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+        let mut child = Command::new("getevent")
+            .args(["-qlc", "1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
 
-    for line in text.lines() {
-        if line.contains("KEY_VOLUMEUP") && line.contains("DOWN") {
-            return Some(1);
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if started.elapsed() >= remaining {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        if line.contains("KEY_VOLUMEDOWN") && line.contains("DOWN") {
-            return Some(0);
+
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(_) => return None,
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        for line in text.lines() {
+            if line.contains("KEY_VOLUMEUP") && line.contains("DOWN") {
+                return Some(1);
+            }
+            if line.contains("KEY_VOLUMEDOWN") && line.contains("DOWN") {
+                return Some(0);
+            }
         }
+        // Non-key event or a key release: listen again until the deadline.
     }
-    None
 }
 
 fn flash_zip_entry(
@@ -483,27 +500,27 @@ fn extract_lpmake(archive: &mut ZipArchive<File>) -> Result<String> {
 
 fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print(" ")?;
-    ui.ui_print("format userdata to ext4?")?;
-    ui.ui_print("  + (VOLUMEUP)   = format (ERASE ALL DATA)")?;
+    ui.ui_print("FULL RESET: erase userdata AND metadata (encryption keys)?")?;
+    ui.ui_print("  + (VOLUMEUP)   = full reset (ERASE ALL DATA)")?;
     ui.ui_print("  - (VOLUMEDOWN) = skip")?;
-    ui.ui_print("  (5s timeout -> skip)")?;
+    ui.ui_print("  (8s timeout -> skip)")?;
     ui.ui_print(" ")?;
 
-    if wait_volume_key(Duration::from_secs(5)) != Some(1) {
-        ui.ui_print("skip format userdata")?;
+    if wait_volume_key(Duration::from_secs(8)) != Some(1) {
+        ui.ui_print("skip full reset")?;
         return Ok(());
     }
 
-    ui.ui_print("WARNING: this will ERASE ALL userdata!")?;
+    ui.ui_print("WARNING: this will ERASE ALL userdata and metadata!")?;
     ui.ui_print("press VOLUMEUP again to confirm, VOLUMEDOWN to cancel")?;
-    if wait_volume_key(Duration::from_secs(5)) != Some(1) {
-        ui.ui_print("cancel format userdata")?;
+    if wait_volume_key(Duration::from_secs(8)) != Some(1) {
+        ui.ui_print("cancel full reset")?;
         return Ok(());
     }
 
-    match crate::userdata::format_data(ui) {
+    match crate::userdata::full_reset(ui) {
         Ok(()) => {}
-        Err(err) => ui.ui_print(&format!("format userdata fail: {err:#}"))?,
+        Err(err) => ui.ui_print(&format!("full reset fail: {err:#}"))?,
     }
     Ok(())
 }
