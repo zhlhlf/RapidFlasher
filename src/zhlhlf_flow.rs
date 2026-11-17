@@ -482,19 +482,6 @@ fn extract_lpmake(archive: &mut ZipArchive<File>) -> Result<String> {
 }
 
 fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
-    let mke2fs = ["/system/bin/mke2fs", "/sbin/mke2fs", "/system/bin/mke2fs.recovery"]
-        .iter()
-        .find(|p| Path::new(p).exists())
-        .map(|p| p.to_string());
-
-    let mke2fs = match mke2fs {
-        Some(path) => path,
-        None => {
-            ui.ui_print("mke2fs not found, skip format userdata")?;
-            return Ok(());
-        }
-    };
-
     ui.ui_print(" ")?;
     ui.ui_print("format userdata to ext4?")?;
     ui.ui_print("  + (VOLUMEUP)   = format (ERASE ALL DATA)")?;
@@ -514,14 +501,9 @@ fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
         return Ok(());
     }
 
-    ui.ui_print("formatting userdata (ext4) ...")?;
-    let status = Command::new(&mke2fs)
-        .args(["-t", "ext4", "-F", "/dev/block/mapper/userdata"])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => ui.ui_print("format userdata ok")?,
-        _ => ui.ui_print("format userdata fail")?,
+    match crate::userdata::format_data(ui) {
+        Ok(()) => {}
+        Err(err) => ui.ui_print(&format!("format userdata fail: {err:#}"))?,
     }
     Ok(())
 }

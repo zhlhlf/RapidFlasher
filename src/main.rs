@@ -13,6 +13,7 @@ mod sparse;
 mod dynamic_partitions;
 mod threaded_writer;
 mod zhlhlf_flow;
+mod userdata;
 
 use recovery::RecoveryUI;
 use func::{verify_device, package_extract_file, package_extract_targz, package_flash_partition, set_slot};
