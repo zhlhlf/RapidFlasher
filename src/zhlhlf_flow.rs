@@ -500,21 +500,21 @@ fn extract_lpmake(archive: &mut ZipArchive<File>) -> Result<String> {
 
 fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print(" ")?;
-    ui.ui_print("FULL RESET: erase userdata AND metadata (encryption keys)?")?;
-    ui.ui_print("  + (VOLUMEUP)   = full reset (ERASE ALL DATA)")?;
+    ui.ui_print("FORMAT DATA (force, keep encryption)?")?;
+    ui.ui_print("  + (VOLUMEUP)   = format data (ERASE ALL DATA)")?;
     ui.ui_print("  - (VOLUMEDOWN) = skip")?;
     ui.ui_print("  (6s timeout -> skip)")?;
     ui.ui_print(" ")?;
 
     if wait_volume_key(Duration::from_secs(6)) != Some(1) {
-        ui.ui_print("skip full reset")?;
+        ui.ui_print("skip format data")?;
         return Ok(());
     }
 
-    ui.ui_print("FULL RESET started ...")?;
-    match crate::userdata::full_reset(ui) {
+    ui.ui_print("FORMAT DATA started ...")?;
+    match crate::userdata::format_data(ui) {
         Ok(()) => {}
-        Err(err) => ui.ui_print(&format!("full reset fail: {err:#}"))?,
+        Err(err) => ui.ui_print(&format!("format data fail: {err:#}"))?,
     }
     Ok(())
 }

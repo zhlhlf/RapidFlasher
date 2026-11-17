@@ -35,6 +35,7 @@ const CRYPT_MAGIC: u32 = 0xF0D1_B4C0;
 const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
 const MNT_DETACH: libc::c_int = 2;
 /// `_IO(0x12, 119)`: discard a byte range on a block device.
+#[allow(dead_code)]
 const BLKDISCARD: libc::c_ulong = 0x1277;
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// ext4 superblock starts at 1024, `s_magic` at offset 0x38 in it.
@@ -51,12 +52,14 @@ const USERDATA_CANDIDATES: [&str; 3] = [
 ];
 
 /// For a full reset we want the raw layer, not a metadata-encryption mapper.
+#[allow(dead_code)]
 const RAW_USERDATA_CANDIDATES: [&str; 3] = [
     "/dev/block/by-name/userdata",
     "/dev/block/bootdevice/by-name/userdata",
     "/dev/block/mapper/userdata",
 ];
 
+#[allow(dead_code)]
 const METADATA_CANDIDATES: [&str; 3] = [
     "/dev/block/mapper/metadata",
     "/dev/block/by-name/metadata",
@@ -170,6 +173,7 @@ fn open_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
     open_block_device(&USERDATA_CANDIDATES, "userdata", ui)
 }
 
+#[allow(dead_code)]
 fn open_metadata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
     open_block_device(&METADATA_CANDIDATES, "metadata", ui)
 }
@@ -242,6 +246,7 @@ fn raw_userdata_layer(candidate: &str) -> Result<PathBuf> {
     bail!("{} is an encryption mapping but has no usable slave", candidate)
 }
 
+#[allow(dead_code)]
 fn open_raw_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
     let mut errors = Vec::new();
 
@@ -274,6 +279,34 @@ fn open_raw_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
     }
 
     bail!("cannot open raw userdata device ({})", errors.join("; "))
+}
+
+/// Choose the device TWRP would format. A metadata-encryption mapper must be
+/// formatted through (the key lives in /metadata and stays), while an FDE
+/// dm-crypt mapper is bypassed: TWRP deletes it and formats the raw device,
+/// then wipes the footer.
+fn open_format_userdata(ui: &mut RecoveryUI) -> Result<(File, PathBuf)> {
+    let mapper = "/dev/block/mapper/userdata";
+    if Path::new(mapper).exists() {
+        if let Some(name) = fs::canonicalize(mapper)
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        {
+            let uuid = dm_attr(&name, "uuid").unwrap_or_default();
+            if uuid.starts_with("CRYPT-") {
+                if let Ok(raw) = raw_userdata_layer(mapper) {
+                    let raw = raw.to_string_lossy().into_owned();
+                    ui.ui_print(&format!(
+                        "FDE mapper detected, formatting raw device {}",
+                        raw
+                    ))?;
+                    return open_block_device(&[raw.as_str()], "userdata (raw)", ui);
+                }
+            }
+        }
+    }
+
+    open_userdata(ui)
 }
 
 fn block_size(file: &File) -> Result<u64> {
@@ -322,6 +355,7 @@ fn wipe_crypt_footer(file: &mut File, size: u64) -> Result<()> {
 /// Discard the whole partition, falling back to writing zeros. This is the
 /// AOSP `wipe_block_device` behaviour used for metadata-encrypted userdata:
 /// leave no filesystem behind, let Android encrypt-in-place on next boot.
+#[allow(dead_code)]
 fn wipe_raw(ui: &mut RecoveryUI, file: &mut File, size: u64) -> Result<()> {
     let range: [u64; 2] = [0, size];
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), BLKDISCARD as _, range.as_ptr()) };
@@ -480,7 +514,7 @@ pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print("unmounting /data and emulated storage ...")?;
     unmount_data(ui)?;
 
-    let (mut device, device_path) = open_userdata(ui)?;
+    let (mut device, device_path) = open_format_userdata(ui)?;
     let size = block_size(&device)?;
     let footer = has_crypt_footer(&mut device, size)?;
 
@@ -523,6 +557,7 @@ pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
 /// AOSP wipes data first and metadata last, so a power loss in between leaves
 /// the old metadata key with a zeroed data partition (recoverable) instead of
 /// a new key with old ciphertext (unbootable).
+#[allow(dead_code)]
 pub fn full_reset(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print("FULL RESET: raw-wipe userdata, then format metadata")?;
     ui.ui_print("unmounting /data, /metadata and emulated storage ...")?;
