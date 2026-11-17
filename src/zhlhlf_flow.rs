@@ -503,21 +503,15 @@ fn maybe_format_userdata(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print("FULL RESET: erase userdata AND metadata (encryption keys)?")?;
     ui.ui_print("  + (VOLUMEUP)   = full reset (ERASE ALL DATA)")?;
     ui.ui_print("  - (VOLUMEDOWN) = skip")?;
-    ui.ui_print("  (8s timeout -> skip)")?;
+    ui.ui_print("  (6s timeout -> skip)")?;
     ui.ui_print(" ")?;
 
-    if wait_volume_key(Duration::from_secs(8)) != Some(1) {
+    if wait_volume_key(Duration::from_secs(6)) != Some(1) {
         ui.ui_print("skip full reset")?;
         return Ok(());
     }
 
-    ui.ui_print("WARNING: this will ERASE ALL userdata and metadata!")?;
-    ui.ui_print("press VOLUMEUP again to confirm, VOLUMEDOWN to cancel")?;
-    if wait_volume_key(Duration::from_secs(8)) != Some(1) {
-        ui.ui_print("cancel full reset")?;
-        return Ok(());
-    }
-
+    ui.ui_print("FULL RESET started ...")?;
     match crate::userdata::full_reset(ui) {
         Ok(()) => {}
         Err(err) => ui.ui_print(&format!("full reset fail: {err:#}"))?,
