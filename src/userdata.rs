@@ -555,7 +555,6 @@ pub fn full_reset(ui: &mut RecoveryUI) -> Result<()> {
         data_size / 1024 / 1024
     ))?;
     wipe_raw(ui, &mut data, data_size)?;
-    drop(data);
     ui.ui_print("userdata raw wipe ok")?;
 
     ui.ui_print(&format!(
@@ -574,6 +573,19 @@ pub fn full_reset(ui: &mut RecoveryUI) -> Result<()> {
     ui.ui_print("metadata ext4 verified")?;
 
     restore_contexts(ui, &metadata_path, "/metadata")?;
+
+    // Leave a valid ext4 filesystem behind: recovery can mount /data right
+    // away, and on a metadata-encrypted device vold will encrypt-in-place this
+    // plaintext filesystem with the newly created key on first boot.
+    let data_blocks = data_size / 4096;
+    ui.ui_print("formatting userdata ext4 (plaintext, Android encrypts on boot) ...")?;
+    mkfs(ui, &data_path, data_blocks)?;
+    if !verify_ext4(&mut data)? {
+        bail!("ext4 superblock missing on userdata {}", data_path.display());
+    }
+    ui.ui_print("userdata ext4 verified")?;
+    restore_contexts(ui, &data_path, "/data")?;
+
     ui.ui_print("FULL RESET done: reboot so Android can create a new metadata key")?;
     Ok(())
 }
