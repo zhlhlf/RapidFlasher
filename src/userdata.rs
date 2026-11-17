@@ -40,6 +40,23 @@ const BLKDISCARD: libc::c_ulong = 0x1277;
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// ext4 superblock starts at 1024, `s_magic` at offset 0x38 in it.
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
+/// f2fs superblock starts at 1024, `magic` is the first 4 bytes.
+const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataFs {
+    Ext4,
+    F2fs,
+}
+
+impl DataFs {
+    fn name(self) -> &'static str {
+        match self {
+            DataFs::Ext4 => "ext4",
+            DataFs::F2fs => "f2fs",
+        }
+    }
+}
 
 /// Prefer the device-mapper node: on metadata-encrypted userdata the
 /// encryption layer must stay in place, so formatting the physical
@@ -65,6 +82,130 @@ const METADATA_CANDIDATES: [&str; 3] = [
     "/dev/block/by-name/metadata",
     "/dev/block/bootdevice/by-name/metadata",
 ];
+
+fn mounted_fs_type(mount_point: &str) -> Option<String> {
+    let table = fs::read_to_string("/proc/mounts").ok()?;
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next()?;
+        let mount = fields.next()?;
+        let fs_type = fields.next()?;
+        if mount == mount_point {
+            return Some(fs_type.to_string());
+        }
+    }
+    None
+}
+
+/// Read the filesystem type for `/data` from the recovery fstab. TWRP uses
+/// `/data <fs> <device>`, AOSP uses `<device> /data <fs>`; accept both.
+fn fstab_data_fs() -> Option<String> {
+    let mut paths = vec![
+        "/etc/recovery.fstab".to_string(),
+        "/etc/twrp.fstab".to_string(),
+        "/etc/fstab".to_string(),
+    ];
+    let mut extra = Vec::new();
+    for dir in [
+        "/etc",
+        "/vendor/etc",
+        "/odm/etc",
+        "/first_stage_ramdisk",
+        "/system/etc",
+    ] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("fstab") {
+                extra.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    extra.sort();
+    paths.extend(extra);
+    paths.dedup();
+
+    for path in paths {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(fs) = parse_fstab_data_fs(&text) {
+            return Some(fs);
+        }
+    }
+    None
+}
+
+fn parse_fstab_data_fs(text: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // TWRP recovery.fstab: /data <fs> <device>
+        if fields.len() >= 2
+            && fields[0] == "/data"
+            && (fields[1] == "ext4" || fields[1] == "f2fs")
+        {
+            return Some(fields[1].to_string());
+        }
+        // AOSP fstab: <device> /data <fs>
+        if fields.len() >= 3
+            && fields[1] == "/data"
+            && (fields[2] == "ext4" || fields[2] == "f2fs")
+        {
+            return Some(fields[2].to_string());
+        }
+    }
+    None
+}
+
+fn blkid_fs(device: &Path) -> Option<String> {
+    let output = Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE"])
+        .arg(device)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Order: mounted /data, then fstab (authoritative for what Android expects),
+/// then blkid (what is currently on disk). This matters because a previous
+/// failed attempt may have left ext4 on an f2fs device.
+fn detect_data_fs(device: &Path, mounted: Option<String>) -> DataFs {
+    // Manual override for testing / unusual fstabs.
+    let override_fs = std::env::var("ZHLHLF_DATA_FS")
+        .ok()
+        .map(|value| value.trim().to_lowercase());
+
+    // fstab is authoritative: it is what Android will try to mount, even if a
+    // previous failed format left a different filesystem on the device.
+    let candidates = [
+        override_fs,
+        fstab_data_fs(),
+        mounted,
+        blkid_fs(device),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        match candidate.as_str() {
+            "f2fs" => return DataFs::F2fs,
+            "ext4" => return DataFs::Ext4,
+            _ => {}
+        }
+    }
+    DataFs::Ext4
+}
 
 /// Mount points that keep `/data` busy. External SD cards live under
 /// `/storage/<uuid>` and are deliberately not matched.
@@ -467,6 +608,76 @@ fn mkfs(ui: &mut RecoveryUI, device: &Path, blocks: u64) -> Result<()> {
     bail!("mke2fs failed for {}", device.display())
 }
 
+fn mkfs_f2fs(ui: &mut RecoveryUI, device: &Path, blocks: u64) -> Result<()> {
+    let tool = find_tool(&["make_f2fs", "mkfs.f2fs"])
+        .context("make_f2fs/mkfs.f2fs not found (looked in PATH, /system/bin, /sbin)")?;
+
+    // TWRP/AOSP use `-g android` and project quota/extra attributes. Older
+    // tools may not know the -O names, so retry plain, then with -f.
+    for (force, with_opts) in [(false, true), (false, false), (true, true), (true, false)] {
+        let mut command = Command::new(&tool);
+        command.args(["-g", "android"]);
+        if force {
+            command.arg("-f");
+        }
+        if with_opts {
+            command.args(["-O", "project_quota,extra_attr"]);
+        }
+        command.arg(device).arg(blocks.to_string());
+        command.stdin(Stdio::null());
+
+        let output = command
+            .output()
+            .with_context(|| format!("failed to run {}", tool))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if force {
+            ui.ui_print("make_f2fs refused, retrying with -f (force)")?;
+        }
+        print_tail(ui, &output)?;
+    }
+
+    bail!("make_f2fs failed for {}", device.display())
+}
+
+fn verify_f2fs(file: &mut File) -> Result<bool> {
+    file.seek(SeekFrom::Start(1024))?;
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return Ok(false);
+    }
+    Ok(u32::from_le_bytes(magic) == F2FS_SUPER_MAGIC)
+}
+
+fn verify_fs(file: &mut File, fs: DataFs) -> Result<bool> {
+    match fs {
+        DataFs::Ext4 => verify_ext4(file),
+        DataFs::F2fs => verify_f2fs(file),
+    }
+}
+
+fn restore_contexts_f2fs(ui: &mut RecoveryUI, device: &Path) -> Result<()> {
+    let Some(sload) = find_tool(&["sload_f2fs"]) else {
+        ui.ui_print("sload_f2fs not found, skip SELinux restore")?;
+        return Ok(());
+    };
+
+    let output = Command::new(sload)
+        .args(["-t", "/data"])
+        .arg(device)
+        .output()
+        .context("failed to run sload_f2fs")?;
+
+    if output.status.success() {
+        ui.ui_print("SELinux contexts restored (f2fs)")?;
+    } else {
+        ui.ui_print("warning: sload_f2fs failed (boot will restore contexts)")?;
+        print_tail(ui, &output)?;
+    }
+    Ok(())
+}
+
 fn verify_ext4(file: &mut File) -> Result<bool> {
     file.seek(SeekFrom::Start(EXT4_MAGIC_OFFSET))?;
     let mut magic = [0u8; 2];
@@ -511,12 +722,17 @@ fn restore_contexts(ui: &mut RecoveryUI, device: &Path, mount_point: &str) -> Re
 /// Format `/data` the way TWRP's "Format Data" does (keeps encryption).
 #[allow(dead_code)]
 pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
+    // Capture the mounted type before unmounting: recovery may have mounted
+    // /data, and that is the fastest reliable hint for ext4 vs f2fs.
+    let mounted_fs = mounted_fs_type("/data");
+
     ui.ui_print("unmounting /data and emulated storage ...")?;
     unmount_data(ui)?;
 
     let (mut device, device_path) = open_format_userdata(ui)?;
     let size = block_size(&device)?;
     let footer = has_crypt_footer(&mut device, size)?;
+    let data_fs = detect_data_fs(&device_path, mounted_fs);
 
     let fs_size = if footer {
         size - CRYPT_FOOTER_OFFSET
@@ -529,26 +745,37 @@ pub fn format_data(ui: &mut RecoveryUI) -> Result<()> {
     }
 
     ui.ui_print(&format!(
-        "userdata size: {} MiB, crypto footer: {}, format: {} blocks",
+        "userdata size: {} MiB, fs: {}, crypto footer: {}, format: {} blocks",
         size / 1024 / 1024,
+        data_fs.name(),
         if footer { "yes" } else { "no" },
         blocks
     ))?;
 
-    ui.ui_print("formatting userdata (ext4) ...")?;
-    mkfs(ui, &device_path, blocks)?;
+    ui.ui_print(&format!("formatting userdata ({}) ...", data_fs.name()))?;
+    match data_fs {
+        DataFs::Ext4 => mkfs(ui, &device_path, blocks)?,
+        DataFs::F2fs => mkfs_f2fs(ui, &device_path, blocks)?,
+    }
 
     if footer {
         ui.ui_print("zeroing FDE crypto footer ...")?;
         wipe_crypt_footer(&mut device, size)?;
     }
 
-    if !verify_ext4(&mut device)? {
-        bail!("ext4 superblock missing after formatting {}", device_path.display());
+    if !verify_fs(&mut device, data_fs)? {
+        bail!(
+            "{} superblock missing after formatting {}",
+            data_fs.name(),
+            device_path.display()
+        );
     }
-    ui.ui_print("ext4 superblock verified")?;
+    ui.ui_print(&format!("{} superblock verified", data_fs.name()))?;
 
-    restore_contexts(ui, &device_path, "/data")?;
+    match data_fs {
+        DataFs::Ext4 => restore_contexts(ui, &device_path, "/data")?,
+        DataFs::F2fs => restore_contexts_f2fs(ui, &device_path)?,
+    }
     ui.ui_print("format userdata ok")?;
     Ok(())
 }
@@ -645,6 +872,19 @@ tmpfs /storage/emulated tmpfs rw 0 0
                 "/data".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parses_data_fs_from_fstab() {
+        assert_eq!(
+            parse_fstab_data_fs("/data f2fs /dev/block/by-name/userdata flags=...").as_deref(),
+            Some("f2fs")
+        );
+        assert_eq!(
+            parse_fstab_data_fs("/dev/block/by-name/userdata /data ext4 wait,check").as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(parse_fstab_data_fs("# /data f2fs /dev/block/x"), None);
     }
 
     #[test]
