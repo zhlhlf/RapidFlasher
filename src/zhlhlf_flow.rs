@@ -53,6 +53,22 @@ pub fn matches(args: &[String]) -> bool {
 }
 
 pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
+    match run_inner(ui, archive) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Errors used to escape to stderr, which recovery never shows.
+            // Report them on the recovery screen before propagating.
+            let _ = ui.ui_print(" ");
+            let _ = ui.ui_print("-----------------------------------------");
+            let _ = ui.ui_print(&format!("FLASH FAILED: {:#}", err));
+            let _ = ui.ui_print("partition may be incomplete, flash a full zip again");
+            let _ = ui.ui_print("-----------------------------------------");
+            Err(err)
+        }
+    }
+}
+
+fn run_inner(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
     let names = collect_entries(archive)?;
     let fw_images: Vec<String> = names
         .iter()
@@ -72,7 +88,23 @@ pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
     ui.ui_print("             Author by zhlhlf")?;
     ui.ui_print("-----------------------------------------")?;
 
-    let slot = ask_slot(ui, "flash fw  -> a or b?    + is a   ||  - is b")?;
+    // A prebuilt super means the zip already holds a complete dynamic-partition
+    // set: pin fw and rom to slot a, then switch the device to a. When the zip
+    // only carries loose images, the user still picks the slot and the super is
+    // built into that slot.
+    let prebuilt_super = has_prebuilt_super(&rom_images);
+    let super_from_images = !prebuilt_super && has_system_image(&rom_images);
+    let rom_flow = prebuilt_super || super_from_images;
+
+    let slot = if prebuilt_super {
+        ui.ui_print("super image found: fw and rom will be flashed to slot a only")?;
+        'a'
+    } else {
+        if super_from_images {
+            ui.ui_print("no prebuilt super: images will be packed into the slot you choose")?;
+        }
+        ask_slot(ui, "flash fw  -> a or b?    + is a   ||  - is b")?
+    };
 
     let work = work_dir();
     fs::create_dir_all(&work)?;
@@ -123,7 +155,7 @@ pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
         // not slot-suffixed on A/B devices. Keep it unsuffixed.
         flash_zip_entry(ui, archive, "images/super.img", &format!("{}/super", pt_dir()))?;
     } else if rom_images.iter().any(|e| e == "images/system.img") {
-        build_and_flash_super(ui, archive, &rom_images)?;
+        build_and_flash_super(ui, archive, &rom_images, slot)?;
         ui.ui_print("super write done")?;
     }
 
@@ -135,6 +167,10 @@ pub fn run(ui: &mut RecoveryUI, archive: &mut ZipArchive<File>) -> Result<()> {
                 flash_zip_entry(ui, archive, entry, &part_dest(name, slot))?;
             }
         }
+    }
+
+    if rom_flow {
+        ensure_active_slot(ui, slot)?;
     }
 
     maybe_format_userdata(ui)?;
@@ -162,9 +198,71 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// True when the zip ships a ready-made super image.
+fn has_prebuilt_super(rom_images: &[String]) -> bool {
+    rom_images
+        .iter()
+        .any(|e| e == "images/super.zst" || e == "images/super.img")
+}
+
+/// True when the zip carries loose images that `build_and_flash_super` packs
+/// into a super of its own.
+fn has_system_image(rom_images: &[String]) -> bool {
+    rom_images.iter().any(|e| e == "images/system.img")
+}
+
 fn part_dest(name: &str, slot: char) -> String {
     let name = name.strip_suffix(".img").unwrap_or(name);
     format!("{}/{}_{}", pt_dir(), name, slot)
+}
+
+/// Make sure the device boots into the slot that was just written.
+fn ensure_active_slot(ui: &mut RecoveryUI, slot: char) -> Result<()> {
+    let current = crate::func::get_active_slot_suffix().unwrap_or_default();
+    let normalized = current.trim_start_matches('_').to_lowercase();
+
+    if current.is_empty() {
+        ui.ui_print("current slot: unknown")?;
+    } else {
+        ui.ui_print(&format!("current slot: {}", current))?;
+    }
+
+    if normalized == slot.to_string() {
+        ui.ui_print(&format!("active slot is {}, no switch needed", slot))?;
+        return Ok(());
+    }
+
+    let index = if slot == 'a' { "0" } else { "1" };
+    ui.ui_print(&format!("switching active slot to {} ...", slot))?;
+    crate::func::set_slot(ui, index)?;
+
+    // ro.boot.slot_suffix only changes after reboot, so ask bootctl instead.
+    match bootctl_active_slot() {
+        Some(value) if value == index => ui.ui_print(&format!(
+            "active slot set to {} (takes effect on reboot)",
+            slot
+        ))?,
+        Some(value) => ui.ui_print(&format!("warning: bootctl reports active slot {}", value))?,
+        None => ui.ui_print(&format!(
+            "active slot switched to {} (takes effect on reboot)",
+            slot
+        ))?,
+    }
+
+    Ok(())
+}
+
+/// `bootctl get-active-boot-slot` prints 0 (slot a) or 1 (slot b).
+fn bootctl_active_slot() -> Option<String> {
+    let output = Command::new("bootctl")
+        .arg("get-active-boot-slot")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn detect_ddr() -> Result<String> {
@@ -327,10 +425,10 @@ fn build_and_flash_super(
     ui: &mut RecoveryUI,
     archive: &mut ZipArchive<File>,
     rom_images: &[String],
+    slot: char,
 ) -> Result<()> {
     check_data_size()?;
 
-    let slot = ask_slot(ui, "flash rom  -> a or b?    + is a   ||  - is b")?;
     let project_dir = format!("{}/project/images", work_dir());
     fs::create_dir_all(&project_dir)?;
 
@@ -532,6 +630,18 @@ mod tests {
         assert!(matches(&["/tmp/zhlhlf".to_string()]));
         assert!(matches(&["sh".to_string(), "scripts/zhlhlf".to_string()]));
         assert!(!matches(&["/tmp/busybox".to_string(), "sh".to_string()]));
+    }
+
+    #[test]
+    fn super_detection() {
+        assert!(has_prebuilt_super(&["images/super.zst".to_string()]));
+        assert!(has_prebuilt_super(&["images/super.img".to_string()]));
+        assert!(!has_prebuilt_super(&["images/system.img".to_string()]));
+
+        assert!(has_system_image(&["images/system.img".to_string()]));
+        assert!(!has_system_image(&["images/super.zst".to_string()]));
+        assert!(!has_system_image(&["images/boot.img".to_string()]));
+        assert!(!has_system_image(&[]));
     }
 
     #[test]
